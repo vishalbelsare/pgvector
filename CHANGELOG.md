@@ -1,3 +1,11 @@
+## 0.8.0 (unreleased)
+
+- Added casts for arrays to `sparsevec`
+- Improved cost estimation
+- Improved performance of HNSW inserts and on-disk index builds
+- Reduced memory usage for HNSW index scans
+- Dropped support for Postgres 12
+
 ## 0.7.4 (2024-08-05)
 
 - Fixed locking for parallel HNSW index builds
