@@ -13,19 +13,28 @@
 #include "port.h"				/* for strtof() */
 #include "sparsevec.h"
 #include "utils/array.h"
-#include "utils/builtins.h"
 #include "utils/float.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
-#include "utils/numeric.h"
+#include "utils/varbit.h"
 #include "vector.h"
 
-#if PG_VERSION_NUM < 130000
-#define TYPALIGN_DOUBLE 'd'
-#define TYPALIGN_INT 'i'
+#if PG_VERSION_NUM >= 160000
+#include "varatt.h"
+#endif
+
+#if PG_VERSION_NUM >= 170000
+#include "parser/scansup.h"
+#endif
+
+#if PG_VERSION_NUM >= 190000
+#define palloc_array_checked(type, count) ((type *) palloc_array(type, count))
+#else
+#define palloc_array_checked(type, count) ((type *) palloc(mul_size(sizeof(type), count)))
 #endif
 
 #define STATE_DIMS(x) (ARR_DIMS(x)[0] - 1)
-#define CreateStateDatums(dim) palloc(sizeof(Datum) * (dim + 1))
+#define CreateStateDatums(dim) palloc_array_checked(Datum, (Size) ((dim) + 1))
 
 /*
  * Get a half from a message buffer
@@ -39,7 +48,7 @@ pq_getmsghalf(StringInfo msg)
 		uint16		i;
 	}			swap;
 
-	swap.i = pq_getmsgint(msg, 2);
+	swap.i = (uint16) pq_getmsgint(msg, 2);
 	return swap.h;
 }
 
@@ -124,19 +133,19 @@ HalfVector *
 InitHalfVector(int dim)
 {
 	HalfVector *result;
-	int			size;
+	Size		size;
 
 	size = HALFVEC_SIZE(dim);
 	result = (HalfVector *) palloc0(size);
 	SET_VARSIZE(result, size);
-	result->dim = dim;
+	result->dim = (int16) dim;
 
 	return result;
 }
 
-/*
- * Check for whitespace, since array_isspace() is static
- */
+#if PG_VERSION_NUM >= 170000
+#define halfvec_isspace(ch) scanner_isspace(ch)
+#else
 static inline bool
 halfvec_isspace(char ch)
 {
@@ -149,6 +158,7 @@ halfvec_isspace(char ch)
 		return true;
 	return false;
 }
+#endif
 
 /*
  * Check state array
@@ -163,24 +173,6 @@ CheckStateArray(ArrayType *statearray, const char *caller)
 		elog(ERROR, "%s: expected state array", caller);
 	return (float8 *) ARR_DATA_PTR(statearray);
 }
-
-#if PG_VERSION_NUM < 120003
-static pg_noinline void
-float_overflow_error(void)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-			 errmsg("value out of range: overflow")));
-}
-
-static pg_noinline void
-float_underflow_error(void)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-			 errmsg("value out of range: underflow")));
-}
-#endif
 
 /*
  * Convert textual representation to internal representation
@@ -250,7 +242,7 @@ halfvec_in(PG_FUNCTION_ARGS)
 		if ((errno == ERANGE && isinf(val)) || (HalfIsInf(x[dim]) && !isinf(val)))
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("\"%s\" is out of range for type halfvec", pnstrdup(pt, stringEnd - pt))));
+					 errmsg("\"%s\" is out of range for type halfvec", pnstrdup(pt, (Size) (stringEnd - pt)))));
 
 		CheckElement(x[dim]);
 		dim++;
@@ -314,11 +306,11 @@ halfvec_out(PG_FUNCTION_ARGS)
 	 * dim * (FLOAT_SHORTEST_DECIMAL_LEN - 1) bytes for
 	 * float_to_shortest_decimal_bufn
 	 *
-	 * dim - 1 bytes for separator
+	 * max(dim - 1, 0) bytes for separator
 	 *
 	 * 3 bytes for [, ], and \0
 	 */
-	buf = (char *) palloc(FLOAT_SHORTEST_DECIMAL_LEN * dim + 2);
+	buf = (char *) palloc(add_size(mul_size(FLOAT_SHORTEST_DECIMAL_LEN, (Size) dim), 3));
 	ptr = buf;
 
 	AppendChar(ptr, '[');
@@ -383,11 +375,11 @@ halfvec_recv(PG_FUNCTION_ARGS)
 	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
 	int32		typmod = PG_GETARG_INT32(2);
 	HalfVector *result;
-	int16		dim;
-	int16		unused;
+	int			dim;
+	int			unused;
 
-	dim = pq_getmsgint(buf, sizeof(int16));
-	unused = pq_getmsgint(buf, sizeof(int16));
+	dim = (int) pq_getmsgint(buf, sizeof(int16));
+	unused = (int) pq_getmsgint(buf, sizeof(int16));
 
 	CheckDim(dim);
 	CheckExpectedDim(typmod, dim);
@@ -418,8 +410,8 @@ halfvec_send(PG_FUNCTION_ARGS)
 	StringInfoData buf;
 
 	pq_begintypsend(&buf);
-	pq_sendint(&buf, vec->dim, sizeof(int16));
-	pq_sendint(&buf, vec->unused, sizeof(int16));
+	pq_sendint16(&buf, (uint16) vec->dim);
+	pq_sendint16(&buf, (uint16) vec->unused);
 	for (int i = 0; i < vec->dim; i++)
 		pq_sendhalf(&buf, vec->x[i]);
 
@@ -479,12 +471,12 @@ array_to_halfvec(PG_FUNCTION_ARGS)
 	if (ARR_ELEMTYPE(array) == INT4OID)
 	{
 		for (int i = 0; i < nelemsp; i++)
-			result->x[i] = Float4ToHalf(DatumGetInt32(elemsp[i]));
+			result->x[i] = Float4ToHalf((float) DatumGetInt32(elemsp[i]));
 	}
 	else if (ARR_ELEMTYPE(array) == FLOAT8OID)
 	{
 		for (int i = 0; i < nelemsp; i++)
-			result->x[i] = Float4ToHalf(DatumGetFloat8(elemsp[i]));
+			result->x[i] = Float4ToHalf((float) DatumGetFloat8(elemsp[i]));
 	}
 	else if (ARR_ELEMTYPE(array) == FLOAT4OID)
 	{
@@ -527,7 +519,7 @@ halfvec_to_float4(PG_FUNCTION_ARGS)
 	Datum	   *datums;
 	ArrayType  *result;
 
-	datums = (Datum *) palloc(sizeof(Datum) * vec->dim);
+	datums = palloc_array_checked(Datum, (Size) vec->dim);
 
 	for (int i = 0; i < vec->dim; i++)
 		datums[i] = Float4GetDatum(HalfToFloat4(vec->x[i]));
@@ -753,7 +745,7 @@ halfvec_l2_normalize(PG_FUNCTION_ARGS)
 	if (norm > 0)
 	{
 		for (int i = 0; i < a->dim; i++)
-			rx[i] = Float4ToHalfUnchecked(HalfToFloat4(ax[i]) / norm);
+			rx[i] = Float4ToHalfUnchecked((float) (HalfToFloat4(ax[i]) / norm));
 
 		/* Check for overflow */
 		for (int i = 0; i < a->dim; i++)
@@ -921,8 +913,21 @@ halfvec_binary_quantize(PG_FUNCTION_ARGS)
 	half	   *ax = a->x;
 	VarBit	   *result = InitBitVector(a->dim);
 	unsigned char *rx = VARBITS(result);
+	int			i = 0;
+	int			count = (a->dim / 8) * 8;
 
-	for (int i = 0; i < a->dim; i++)
+	/* Auto-vectorized on aarch64 */
+	for (; i < count; i += 8)
+	{
+		unsigned char result_byte = 0;
+
+		for (int j = 0; j < 8; j++)
+			result_byte |= (HalfToFloat4(ax[i + j]) > 0) << (7 - j);
+
+		rx[i / 8] = result_byte;
+	}
+
+	for (; i < a->dim; i++)
 		rx[i / 8] |= (HalfToFloat4(ax[i]) > 0) << (7 - (i % 8));
 
 	PG_RETURN_VARBIT_P(result);
@@ -1103,7 +1108,7 @@ halfvec_accum(PG_FUNCTION_ARGS)
 	ArrayType  *statearray = PG_GETARG_ARRAYTYPE_P(0);
 	HalfVector *newval = PG_GETARG_HALFVEC_P(1);
 	float8	   *statevalues;
-	int16		dim;
+	int			dim;
 	bool		newarr;
 	float8		n;
 	Datum	   *statedatums;
@@ -1164,7 +1169,7 @@ halfvec_avg(PG_FUNCTION_ARGS)
 	ArrayType  *statearray = PG_GETARG_ARRAYTYPE_P(0);
 	float8	   *statevalues;
 	float8		n;
-	uint16		dim;
+	int			dim;
 	HalfVector *result;
 
 	/* Check array before using */
@@ -1181,7 +1186,7 @@ halfvec_avg(PG_FUNCTION_ARGS)
 	result = InitHalfVector(dim);
 	for (int i = 0; i < dim; i++)
 	{
-		result->x[i] = Float4ToHalf(statevalues[i + 1] / n);
+		result->x[i] = Float4ToHalf((float) (statevalues[i + 1] / n));
 		CheckElement(result->x[i]);
 	}
 
@@ -1206,7 +1211,15 @@ sparsevec_to_halfvec(PG_FUNCTION_ARGS)
 
 	result = InitHalfVector(dim);
 	for (int i = 0; i < svec->nnz; i++)
-		result->x[svec->indices[i]] = Float4ToHalf(values[i]);
+	{
+		int32		index = svec->indices[i];
+
+		/* Safety check */
+		if (index < 0 || index >= dim)
+			elog(ERROR, "index out of bounds");
+
+		result->x[index] = Float4ToHalf(values[i]);
+	}
 
 	PG_RETURN_POINTER(result);
 }

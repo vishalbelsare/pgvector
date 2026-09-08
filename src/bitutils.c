@@ -31,10 +31,12 @@
 #define BIT_TARGET_CLONES
 #endif
 
-/* Use built-ins when possible for inlining */
-#if defined(HAVE__BUILTIN_POPCOUNT) && defined(HAVE_LONG_INT_64)
+/* Use built-ins when possible for Postgres < 19 for inlining */
+#if PG_VERSION_NUM >= 190000
+#define popcount64(x) pg_popcount64(x)
+#elif defined(HAVE__BUILTIN_POPCOUNT) && (defined(HAVE_LONG_INT_64) || SIZEOF_LONG == 8)
 #define popcount64(x) __builtin_popcountl(x)
-#elif defined(HAVE__BUILTIN_POPCOUNT) && defined(HAVE_LONG_LONG_INT_64)
+#elif defined(HAVE__BUILTIN_POPCOUNT) && (defined(HAVE_LONG_LONG_INT_64) || SIZEOF_LONG_LONG == 8)
 #define popcount64(x) __builtin_popcountll(x)
 #elif !defined(_MSC_VER)
 /* Fails to resolve with MSVC */
@@ -57,7 +59,7 @@ BitHammingDistanceDefault(uint32 bytes, unsigned char *ax, unsigned char *bx, ui
 		memcpy(&axs, ax, sizeof(uint64));
 		memcpy(&bxs, bx, sizeof(uint64));
 
-		distance += popcount64(axs ^ bxs);
+		distance += (uint64) popcount64(axs ^ bxs);
 
 		ax += sizeof(uint64);
 		bx += sizeof(uint64);
@@ -106,9 +108,9 @@ BitJaccardDistanceDefault(uint32 bytes, unsigned char *ax, unsigned char *bx, ui
 		memcpy(&axs, ax, sizeof(uint64));
 		memcpy(&bxs, bx, sizeof(uint64));
 
-		ab += popcount64(axs & bxs);
-		aa += popcount64(axs);
-		bb += popcount64(bxs);
+		ab += (uint64) popcount64(axs & bxs);
+		aa += (uint64) popcount64(axs);
+		bb += (uint64) popcount64(bxs);
 
 		ax += sizeof(uint64);
 		bx += sizeof(uint64);
@@ -125,7 +127,7 @@ BitJaccardDistanceDefault(uint32 bytes, unsigned char *ax, unsigned char *bx, ui
 	if (ab == 0)
 		return 1;
 	else
-		return 1 - (ab / ((double) (aa + bb - ab)));
+		return 1 - ((double) ab / (double) (aa + bb - ab));
 }
 
 #ifdef BIT_DISPATCH
@@ -169,7 +171,7 @@ BitJaccardDistanceAvx512Popcount(uint32 bytes, unsigned char *ax, unsigned char 
 #endif
 
 TARGET_XSAVE static bool
-SupportsAvx512Popcount()
+SupportsAvx512Popcount(void)
 {
 	unsigned int exx[4] = {0, 0, 0, 0};
 

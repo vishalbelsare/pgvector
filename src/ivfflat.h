@@ -9,16 +9,29 @@
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
 #include "port.h"				/* for random() */
+#include "storage/condition_variable.h"
 #include "utils/sampling.h"
 #include "utils/tuplesort.h"
 #include "vector.h"
+
+#if PG_VERSION_NUM >= 160000
+#include "varatt.h"
+#endif
 
 #if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
 #endif
 
+#if PG_VERSION_NUM < 190000
+#include "storage/shmem.h"		/* for add_size()/mul_size() in some versions */
+#endif
+
 #ifdef IVFFLAT_BENCH
 #include "portability/instr_time.h"
+#endif
+
+#if PG_VERSION_NUM >= 190000
+typedef Pointer Item;
 #endif
 
 #define IVFFLAT_MAX_DIM 2000
@@ -50,7 +63,7 @@
 #define PROGRESS_IVFFLAT_PHASE_ASSIGN	3
 #define PROGRESS_IVFFLAT_PHASE_LOAD		4
 
-#define IVFFLAT_LIST_SIZE(size)	(offsetof(IvfflatListData, center) + size)
+#define IVFFLAT_LIST_SIZE(size)	add_size(offsetof(IvfflatListData, center), size)
 
 #define IvfflatPageGetOpaque(page)	((IvfflatPageOpaque) PageGetSpecialPointer(page))
 #define IvfflatPageGetMeta(page)	((IvfflatMetaPageData *) PageGetContents(page))
@@ -73,13 +86,36 @@
 #if PG_VERSION_NUM >= 150000
 #define RandomDouble() pg_prng_double(&pg_global_prng_state)
 #define RandomInt() pg_prng_uint32(&pg_global_prng_state)
+#define SeedRandom(seed) pg_prng_seed(&pg_global_prng_state, seed)
 #else
 #define RandomDouble() (((double) random()) / MAX_RANDOM_VALUE)
 #define RandomInt() random()
+#define SeedRandom(seed) srandom(seed)
+#endif
+
+#if PG_VERSION_NUM < 140006
+#define palloc_object(type) ((type *) palloc(sizeof(type)))
+#define palloc0_object(type) ((type *) palloc0(sizeof(type)))
+#endif
+
+#if PG_VERSION_NUM >= 190000
+#define palloc_array_checked(type, count) ((type *) palloc_array(type, count))
+#define palloc0_array_checked(type, count) ((type *) palloc0_array(type, count))
+#else
+#define palloc_array_checked(type, count) ((type *) palloc(mul_size(sizeof(type), count)))
+#define palloc0_array_checked(type, count) ((type *) palloc0(mul_size(sizeof(type), count)))
 #endif
 
 /* Variables */
 extern int	ivfflat_probes;
+extern int	ivfflat_iterative_scan;
+extern int	ivfflat_max_probes;
+
+typedef enum IvfflatIterativeScanMode
+{
+	IVFFLAT_ITERATIVE_SCAN_OFF,
+	IVFFLAT_ITERATIVE_SCAN_RELAXED
+}			IvfflatIterativeScanMode;
 
 typedef struct VectorArrayData
 {
@@ -165,6 +201,7 @@ typedef struct IvfflatBuildState
 	Relation	index;
 	IndexInfo  *indexInfo;
 	const		IvfflatTypeInfo *typeInfo;
+	TupleDesc	tupdesc;
 
 	/* Settings */
 	int			dimensions;
@@ -184,6 +221,7 @@ typedef struct IvfflatBuildState
 	VectorArray samples;
 	VectorArray centers;
 	ListInfo   *listInfo;
+	Size		itemsize;
 
 #ifdef IVFFLAT_KMEANS_DEBUG
 	double		inertia;
@@ -194,14 +232,16 @@ typedef struct IvfflatBuildState
 	/* Sampling */
 	BlockSamplerData bs;
 	ReservoirStateData rstate;
-	int			rowstoskip;
+	double		samplerows;
+	double		rowstoskip;
 
 	/* Sorting */
 	Tuplesortstate *sortstate;
-	TupleDesc	tupdesc;
+	TupleDesc	sortdesc;
 	TupleTableSlot *slot;
 
 	/* Memory */
+	Size		memoryUsed;
 	MemoryContext tmpCtx;
 
 	/* Parallel builds */
@@ -247,14 +287,18 @@ typedef struct IvfflatScanOpaqueData
 {
 	const		IvfflatTypeInfo *typeInfo;
 	int			probes;
+	int			maxProbes;
 	int			dimensions;
 	bool		first;
+	Datum		value;
+	MemoryContext tmpCtx;
 
 	/* Sorting */
 	Tuplesortstate *sortstate;
 	TupleDesc	tupdesc;
-	TupleTableSlot *slot;
-	bool		isnull;
+	TupleTableSlot *vslot;
+	TupleTableSlot *mslot;
+	BufferAccessStrategy bas;
 
 	/* Support functions */
 	FmgrInfo   *procinfo;
@@ -264,34 +308,48 @@ typedef struct IvfflatScanOpaqueData
 
 	/* Lists */
 	pairingheap *listQueue;
-	IvfflatScanList lists[FLEXIBLE_ARRAY_MEMBER];	/* must come last */
+	BlockNumber *listPages;
+	int			listIndex;
+	IvfflatScanList *lists;
 }			IvfflatScanOpaqueData;
 
 typedef IvfflatScanOpaqueData * IvfflatScanOpaque;
 
-#define VECTOR_ARRAY_SIZE(_length, _size) (sizeof(VectorArrayData) + (_length) * MAXALIGN(_size))
+#define VECTOR_ARRAY_SIZE(_length, _size) add_size(sizeof(VectorArrayData), mul_size((Size) (_length), MAXALIGN(_size)))
 
 /* Use functions instead of macros to avoid double evaluation */
 
 static inline Pointer
 VectorArrayGet(VectorArray arr, int offset)
 {
-	return ((char *) arr->items) + (offset * arr->itemsize);
+	/* Safety check */
+	if (offset < 0 || offset >= arr->maxlen)
+		elog(ERROR, "index out of bounds");
+
+	return ((char *) arr->items) + ((Size) offset * arr->itemsize);
 }
 
 static inline void
 VectorArraySet(VectorArray arr, int offset, Pointer val)
 {
-	memcpy(VectorArrayGet(arr, offset), val, VARSIZE_ANY(val));
+	Size		size = VARSIZE_ANY(val);
+
+	/* Safety check */
+	if (size > arr->itemsize)
+		elog(ERROR, "item too large");
+
+	memcpy(VectorArrayGet(arr, offset), val, size);
 }
 
 /* Methods */
 VectorArray VectorArrayInit(int maxlen, int dimensions, Size itemsize);
 void		VectorArrayFree(VectorArray arr);
-void		IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo);
+void		IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, Size memoryUsed);
 FmgrInfo   *IvfflatOptionalProcInfo(Relation index, uint16 procnum);
 Datum		IvfflatNormValue(const IvfflatTypeInfo * typeInfo, Oid collation, Datum value);
 bool		IvfflatCheckNorm(FmgrInfo *procinfo, Oid collation, Datum value);
+void		IvfflatNormVectors(const IvfflatTypeInfo * typeInfo, Oid collation, VectorArray arr, MemoryContext tmpCtx);
+void		IvfflatCheckMemoryUsage(Size totalSize);
 int			IvfflatGetLists(Relation index);
 void		IvfflatGetMetaPageInfo(Relation index, int *lists, int *dimensions);
 void		IvfflatUpdateList(Relation index, ListInfo listInfo, BlockNumber insertPage, BlockNumber originalInsertPage, BlockNumber startPage, ForkNumber forkNum);

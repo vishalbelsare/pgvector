@@ -1,13 +1,21 @@
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/generic_xlog.h"
-#include "bitvec.h"
-#include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "halfutils.h"
 #include "halfvec.h"
 #include "ivfflat.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/memutils.h"
+#include "utils/relcache.h"
+#include "utils/varbit.h"
+#include "vector.h"
+
+#if PG_VERSION_NUM >= 160000
+#include "varatt.h"
+#endif
 
 /*
  * Allocate a vector array
@@ -15,16 +23,21 @@
 VectorArray
 VectorArrayInit(int maxlen, int dimensions, Size itemsize)
 {
-	VectorArray res = palloc(sizeof(VectorArrayData));
+	VectorArray res;
+
+	/* Safety check */
+	if (maxlen < 1 || dimensions < 1 || itemsize == 0)
+		elog(ERROR, "cannot create vector array");
 
 	/* Ensure items are aligned to prevent UB */
 	itemsize = MAXALIGN(itemsize);
 
+	res = palloc_object(VectorArrayData);
 	res->length = 0;
 	res->maxlen = maxlen;
 	res->dim = dimensions;
 	res->itemsize = itemsize;
-	res->items = palloc_extended(maxlen * itemsize, MCXT_ALLOC_ZERO | MCXT_ALLOC_HUGE);
+	res->items = palloc_extended(mul_size((Size) maxlen, itemsize), MCXT_ALLOC_ZERO | MCXT_ALLOC_HUGE);
 	return res;
 }
 
@@ -80,6 +93,40 @@ bool
 IvfflatCheckNorm(FmgrInfo *procinfo, Oid collation, Datum value)
 {
 	return DatumGetFloat8(FunctionCall1Coll(procinfo, collation, value)) > 0;
+}
+
+/*
+ * Normalize vectors
+ */
+void
+IvfflatNormVectors(const IvfflatTypeInfo * typeInfo, Oid collation, VectorArray arr, MemoryContext tmpCtx)
+{
+	MemoryContext oldCtx = MemoryContextSwitchTo(tmpCtx);
+
+	for (int i = 0; i < arr->length; i++)
+	{
+		Datum		value = PointerGetDatum(VectorArrayGet(arr, i));
+		Datum		newValue = IvfflatNormValue(typeInfo, collation, value);
+
+		VectorArraySet(arr, i, DatumGetPointer(newValue));
+		MemoryContextReset(tmpCtx);
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+}
+
+/*
+ * Check memory usage
+ */
+void
+IvfflatCheckMemoryUsage(Size totalSize)
+{
+	/* Add one to error message to ceil */
+	if (totalSize / 1024 > (Size) maintenance_work_mem)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("memory required is %zu MB, maintenance_work_mem is %d MB",
+						totalSize / (1024 * 1024) + 1, maintenance_work_mem / 1024)));
 }
 
 /*
@@ -248,7 +295,7 @@ HalfvecItemSize(int dimensions)
 static Size
 BitItemSize(int dimensions)
 {
-	return VARBITTOTALLEN(dimensions);
+	return VARBITTOTALLEN((Size) dimensions);
 }
 
 static void
@@ -257,10 +304,10 @@ VectorUpdateCenter(Pointer v, int dimensions, float *x)
 	Vector	   *vec = (Vector *) v;
 
 	SET_VARSIZE(vec, VECTOR_SIZE(dimensions));
-	vec->dim = dimensions;
+	vec->dim = (int16) dimensions;
 
-	for (int k = 0; k < dimensions; k++)
-		vec->x[k] = x[k];
+	for (int i = 0; i < dimensions; i++)
+		vec->x[i] = x[i];
 }
 
 static void
@@ -269,10 +316,10 @@ HalfvecUpdateCenter(Pointer v, int dimensions, float *x)
 	HalfVector *vec = (HalfVector *) v;
 
 	SET_VARSIZE(vec, HALFVEC_SIZE(dimensions));
-	vec->dim = dimensions;
+	vec->dim = (int16) dimensions;
 
-	for (int k = 0; k < dimensions; k++)
-		vec->x[k] = Float4ToHalfUnchecked(x[k]);
+	for (int i = 0; i < dimensions; i++)
+		vec->x[i] = Float4ToHalfUnchecked(x[i]);
 }
 
 static void
@@ -281,32 +328,36 @@ BitUpdateCenter(Pointer v, int dimensions, float *x)
 	VarBit	   *vec = (VarBit *) v;
 	unsigned char *nx = VARBITS(vec);
 
-	SET_VARSIZE(vec, VARBITTOTALLEN(dimensions));
+	SET_VARSIZE(vec, VARBITTOTALLEN((Size) dimensions));
 	VARBITLEN(vec) = dimensions;
 
-	for (uint32 k = 0; k < VARBITBYTES(vec); k++)
-		nx[k] = 0;
+	for (uint32 i = 0; i < VARBITBYTES(vec); i++)
+		nx[i] = 0;
 
-	for (int k = 0; k < dimensions; k++)
-		nx[k / 8] |= (x[k] > 0.5 ? 1 : 0) << (7 - (k % 8));
+	for (int i = 0; i < dimensions; i++)
+		nx[i / 8] |= (x[i] > 0.5 ? 1 : 0) << (7 - (i % 8));
 }
 
 static void
 VectorSumCenter(Pointer v, float *x)
 {
 	Vector	   *vec = (Vector *) v;
+	int			dim = vec->dim;
 
-	for (int k = 0; k < vec->dim; k++)
-		x[k] += vec->x[k];
+	/* Auto-vectorized */
+	for (int i = 0; i < dim; i++)
+		x[i] += vec->x[i];
 }
 
 static void
 HalfvecSumCenter(Pointer v, float *x)
 {
 	HalfVector *vec = (HalfVector *) v;
+	int			dim = vec->dim;
 
-	for (int k = 0; k < vec->dim; k++)
-		x[k] += HalfToFloat4(vec->x[k]);
+	/* Auto-vectorized on aarch64 */
+	for (int i = 0; i < dim; i++)
+		x[i] += HalfToFloat4(vec->x[i]);
 }
 
 static void
@@ -314,8 +365,8 @@ BitSumCenter(Pointer v, float *x)
 {
 	VarBit	   *vec = (VarBit *) v;
 
-	for (int k = 0; k < VARBITLEN(vec); k++)
-		x[k] += (float) (((VARBITS(vec)[k / 8]) >> (7 - (k % 8))) & 0x01);
+	for (int i = 0; i < VARBITLEN(vec); i++)
+		x[i] += (float) (((VARBITS(vec)[i / 8]) >> (7 - (i % 8))) & 0x01);
 }
 
 /*
@@ -355,7 +406,7 @@ ivfflat_halfvec_support(PG_FUNCTION_ARGS)
 	};
 
 	PG_RETURN_POINTER(&typeInfo);
-};
+}
 
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ivfflat_bit_support);
 Datum
@@ -370,4 +421,4 @@ ivfflat_bit_support(PG_FUNCTION_ARGS)
 	};
 
 	PG_RETURN_POINTER(&typeInfo);
-};
+}

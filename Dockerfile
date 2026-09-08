@@ -1,8 +1,11 @@
-ARG PG_MAJOR=16
-FROM postgres:$PG_MAJOR
+# syntax=docker/dockerfile:1
+
+ARG PG_MAJOR=17
+ARG DEBIAN_CODENAME=bookworm
+FROM postgres:$PG_MAJOR-$DEBIAN_CODENAME
 ARG PG_MAJOR
 
-COPY . /tmp/pgvector
+ADD https://github.com/pgvector/pgvector.git#v0.8.6 /tmp/pgvector
 
 RUN apt-get update && \
 		apt-mark hold locales && \

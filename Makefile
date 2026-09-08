@@ -1,5 +1,5 @@
 EXTENSION = vector
-EXTVERSION = 0.7.4
+EXTVERSION = 0.8.6
 
 MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
@@ -27,10 +27,15 @@ ifneq ($(filter ppc64%, $(shell uname -m)), )
 	OPTFLAGS =
 endif
 
+# RISC-V64 doesn't support -march=native
+ifeq ($(shell uname -m), riscv64)
+	OPTFLAGS =
+endif
+
 # For auto-vectorization:
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
-PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -ffp-contract=fast
 
 # Debug GCC auto-vectorization
 # PG_CFLAGS += -fopt-info-vec
@@ -66,7 +71,7 @@ dist:
 	git archive --format zip --prefix=$(EXTENSION)-$(EXTVERSION)/ --output dist/$(EXTENSION)-$(EXTVERSION).zip master
 
 # for Docker
-PG_MAJOR ?= 16
+PG_MAJOR ?= 17
 
 .PHONY: docker
 
@@ -76,4 +81,9 @@ docker:
 .PHONY: docker-release
 
 docker-release:
-	docker buildx build --push --pull --no-cache --platform linux/amd64,linux/arm64 --build-arg PG_MAJOR=$(PG_MAJOR) -t pgvector/pgvector:pg$(PG_MAJOR) -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR) .
+	docker buildx build --push --pull --no-cache --platform linux/amd64,linux/arm64 --build-arg PG_MAJOR=$(PG_MAJOR) --build-arg DEBIAN_CODENAME=bookworm -t pgvector/pgvector:pg$(PG_MAJOR) -t pgvector/pgvector:pg$(PG_MAJOR)-bookworm -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR) -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR)-bookworm .
+
+.PHONY: docker-release-trixie
+
+docker-release-trixie:
+	docker buildx build --push --pull --no-cache --platform linux/amd64,linux/arm64 --build-arg PG_MAJOR=$(PG_MAJOR) --build-arg DEBIAN_CODENAME=trixie -t pgvector/pgvector:pg$(PG_MAJOR)-trixie -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR)-trixie .
